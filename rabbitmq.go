@@ -1,39 +1,41 @@
 package rabbitmq
 
 import (
+  "context"
+  "encoding/json"
   "errors"
   "fmt"
+  "github.com/chenyu116/rattle"
   "github.com/streadway/amqp"
   "log"
   "sync"
   "time"
 )
 
-type Config struct {
-  HostPort  string
-  Username  string
-  Password  string
-  Prefetch  int
-  Exchanges []map[string]string
-  QueueName string
-  Scheme    string
-  amqp      amqp.Config
+const (
+  TYPE_REPLY = "REPLY"
+  TYPE_SEND  = "SEND"
+)
+
+func NewConfig() *Config {
+  return new(Config)
 }
 
-var RabbitMQ *Client
-
 type Client struct {
-  config       *Config
-  conn         *amqp.Connection
-  channel      *amqp.Channel
-  deliveryTag  uint64
-  deliveryMu   sync.Mutex
-  confirmMap   map[string]chan bool
-  confirmMapMu sync.Mutex
-  confirm      chan uint64
-  confirmChan  chan amqp.Confirmation
-  consume      func(msg amqp.Delivery) error
-  recovering   bool
+  config               *Config
+  conn                 *amqp.Connection
+  channel              *amqp.Channel
+  confirmMap           map[string]*replyConfirm
+  confirmMapMu         sync.Mutex
+  confirm              chan uint64
+  confirmChan          chan amqp.Confirmation
+  messageConsumer      []func(msg amqp.Delivery)
+  replyConsumer        []func(msg amqp.Delivery)
+  consumersLenMap      map[string]int32
+  consumersLenMu       sync.RWMutex
+  recovering           bool
+  synchronizing        bool
+  exchangeConsumersLen int32
 }
 
 func NewClient(cfg *Config) *Client {
@@ -45,13 +47,16 @@ func NewClient(cfg *Config) *Client {
     cfg.Scheme = "amqp"
   }
   return &Client{
-    config:     cfg,
-    confirmMap: make(map[string]chan bool, 10),
+    config:          cfg,
+    confirmMap:      make(map[string]*replyConfirm, 10),
+    consumersLenMap: make(map[string]int32),
   }
 }
-
-func (c *Client) SetConsumer(consumer func(msg amqp.Delivery) error) {
-  c.consume = consumer
+func (c *Client) AddReplyConsumer(consumer func(msg amqp.Delivery)) {
+  c.replyConsumer = append(c.replyConsumer, consumer)
+}
+func (c *Client) AddMessageConsumer(consumer func(msg amqp.Delivery)) {
+  c.messageConsumer = append(c.messageConsumer, consumer)
 }
 func (c *Client) Start() (err error) {
   amqpUrl := fmt.Sprintf("%s://%s:%s@%s/", c.config.Scheme, c.config.Username, c.config.Password, c.config.HostPort)
@@ -59,7 +64,6 @@ func (c *Client) Start() (err error) {
   if err != nil {
     return
   }
-
   c.channel, err = c.conn.Channel()
   if err != nil {
     return
@@ -74,13 +78,17 @@ func (c *Client) Start() (err error) {
   if err != nil {
     return
   }
+  args := make(amqp.Table)
+  for _, v := range c.config.Exchanges {
+    args[v["name"]] = c.config.QueueName
+  }
   _, err = c.channel.QueueDeclare(
     c.config.QueueName, // name
     true,               // durable
     true,               // delete when unused
     false,              // exclusive
     false,              // no-wait
-    nil,                // arguments
+    args,               // arguments
   )
   if err != nil {
     return
@@ -106,13 +114,49 @@ func (c *Client) Start() (err error) {
   if !c.recovering {
     go c.recovery()
   }
+  if !c.synchronizing {
+    go c.sync()
+  }
   return
 }
 
+func (c *Client) sync() {
+  time.Sleep(time.Second * 3)
+  fmt.Println("sync")
+  //exchangeMap := make(map[string])
+  for {
+    res, _, err := rattle.New(nil).Get("https://rbtmqman.astat.cn/api/queues").
+      SetBasicAuth(c.
+        config.
+        Username,
+        c.config.Password).Send()
+    if err != nil {
+      log.Println(err)
+      continue
+    }
+    var queues []queue
+    err = json.Unmarshal(res, &queues)
+    if err != nil {
+      log.Println(err)
+      continue
+    }
+    c.consumersLenMu.Lock()
+    c.consumersLenMap = make(map[string]int32)
+    for _, v := range queues {
+      for k := range v.Arguments {
+        c.consumersLenMap[k]++
+      }
+    }
+    c.consumersLenMu.Unlock()
+    fmt.Println(c.consumersLenMap)
+    time.Sleep(time.Second * 5)
+  }
+}
 func (c *Client) consumerMessage() {
   defer func() {
     log.Println("consumerMessage stopped")
   }()
+
   messages, err := c.channel.Consume(
     c.config.QueueName, // queue
     c.config.QueueName, // consumer
@@ -125,39 +169,53 @@ func (c *Client) consumerMessage() {
 
   if err != nil {
     log.Fatal(err)
-    return
   }
 
   log.Println("consumerMessage started", c.config.QueueName)
-  for d := range messages {
+  for msg := range messages {
+    log.Println(c.config.QueueName, "got", msg.ReplyTo, string(msg.Body))
     go func(d amqp.Delivery) {
-      var err error
-      if d.ReplyTo != "" {
+      if d.Type == TYPE_REPLY && d.ReplyTo != "" {
         c.confirmMapMu.Lock()
         if b, ok := c.confirmMap[d.ReplyTo]; ok {
-          b <- true
-          delete(c.confirmMap, d.ReplyTo)
+          b.AddMessage(d)
+          b.Incr()
+          if b.Finish() {
+            b.Done()
+            delete(c.confirmMap, d.ReplyTo)
+          }
+          fmt.Println("consumerMessage Reply", c.confirmMap[d.ReplyTo])
+          if len(c.replyConsumer) > 0 {
+            go func(rMsg amqp.Delivery) {
+              for _, rc := range c.replyConsumer {
+                rc(rMsg)
+              }
+            }(d)
+          }
         }
         c.confirmMapMu.Unlock()
+
       } else {
-        if c.consume != nil {
-          err = c.consume(d)
+        for _, mc := range c.messageConsumer {
+          mc(d)
         }
       }
-      if err == nil {
-        _ = d.Ack(false)
-      }
-    }(d)
+      _ = d.Ack(false)
+    }(msg)
   }
 }
 
 func (c *Client) Publish(exchange, routeKey string,
-  msg amqp.Publishing, confirmChan chan bool) (err error) {
+  msg amqp.Publishing, confirms ...Confirm) (err error) {
   if c.isClosed() {
     err = errors.New("source channel closed")
     return
   }
-  if confirmChan != nil && msg.ReplyTo == "" {
+  confirm := Confirm{}
+  if len(confirms) > 0 {
+    confirm = confirms[0]
+  }
+  if confirm.NeedConfirm && msg.ReplyTo == "" {
     err = errors.New("confirm 'ReplyTo' empty")
     return
   }
@@ -170,24 +228,60 @@ func (c *Client) Publish(exchange, routeKey string,
   if err != nil {
     return
   }
-
   if m := <-c.confirmChan; !m.Ack {
     err = errors.New("publish fail")
     return
   }
 
-  if confirmChan != nil {
-    c.confirmMapMu.Lock()
-    c.confirmMap[msg.ReplyTo] = confirmChan
-    c.confirmMapMu.Unlock()
+  if confirm.NeedConfirm {
+    if confirm.Multi {
+      go func() {
+        var confirmLen int32 = 1
+        c.consumersLenMu.RLock()
+        if cs, ok := c.consumersLenMap[exchange]; ok {
+          if cs == 0 {
+            return
+          }
+          confirmLen = cs
+        }
+        c.consumersLenMu.RUnlock()
+        rc := &replyConfirm{
+          len:     confirmLen,
+          done:    make(chan bool),
+          replies: make([]amqp.Delivery, confirmLen),
+        }
+        c.confirmMapMu.Lock()
+        c.confirmMap[msg.ReplyTo] = rc
+        c.confirmMapMu.Unlock()
 
-    select {
-    case <-confirmChan:
-    case <-time.After(time.Second * 10):
-      err = errors.New("destination not confirmed")
+        fmt.Printf("Multi %+v\n", c.confirmMap[msg.ReplyTo])
+        <-rc.done
+      }()
+    } else {
+      var confirmLen int32 = 1
+      rc := &replyConfirm{
+        len:     confirmLen,
+        done:    make(chan bool),
+        replies: make([]amqp.Delivery, confirmLen),
+      }
       c.confirmMapMu.Lock()
-      delete(c.confirmMap, msg.ReplyTo)
+      c.confirmMap[msg.ReplyTo] = rc
       c.confirmMapMu.Unlock()
+      if confirm.Timeout == 0 {
+        confirm.Timeout = time.Second * 10
+      }
+      ctx, cancel := context.WithTimeout(context.Background(), confirm.Timeout)
+      select {
+      case <-rc.done:
+        fmt.Println("rc.done")
+        cancel()
+        return
+      case <-ctx.Done():
+        err = errors.New("destination not confirmed")
+        c.confirmMapMu.Lock()
+        delete(c.confirmMap, msg.ReplyTo)
+        c.confirmMapMu.Unlock()
+      }
     }
   }
   return
@@ -201,6 +295,7 @@ func (c *Client) recovery() {
     if !c.isClosed() || reconnecting {
       continue
     }
+    log.Println("start recovery")
     reconnecting = true
     err := c.Start()
     if err != nil {
