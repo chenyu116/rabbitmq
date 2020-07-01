@@ -75,13 +75,12 @@ func (c *Client) Start() (err error) {
 	if err != nil {
 		return
 	}
+	c.confirmChan = c.channel.NotifyPublish(make(chan amqp.Confirmation, 1))
+	err = c.channel.Confirm(false)
+	if err != nil {
+		return
+	}
 	if c.config.QueueEnable {
-		c.confirmChan = c.channel.NotifyPublish(make(chan amqp.Confirmation, 1))
-		err = c.channel.Confirm(false)
-		if err != nil {
-			return
-		}
-
 		err = c.channel.Qos(c.config.Prefetch, 0, false)
 		if err != nil {
 			return
