@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	TYPE_REPLY = "REPLY"
-	TYPE_SEND  = "SEND"
+	TYPE_REPLY  = "REPLY"
+	TYPE_SIMPLE = "SIMPLE"
 )
 
 type Client struct {
@@ -86,12 +86,12 @@ func (c *Client) Start() (err error) {
 		return
 	}
 	_, err = c.channel.QueueDeclare(
-    c.queueName, // name
-		true,      // durable
-		true,      // delete when unused
-		false,     // exclusive
-		false,     // no-wait
-		nil,       // arguments
+		c.queueName,              // name
+		true,                     // durable
+		c.config.QueueAutoDelete, // delete when unused
+		false,                    // exclusive
+		false,                    // no-wait
+		nil,                      // arguments
 	)
 	if err != nil {
 		return
@@ -103,9 +103,9 @@ func (c *Client) Start() (err error) {
 			return
 		}
 		err = c.channel.QueueBind(
-      c.queueName, // queue name
-      c.queueName, // routing key
-			v.Name,    // exchange
+			c.queueName, // queue name
+			c.queueName, // routing key
+			v.Name,      // exchange
 			false,
 			nil,
 		)
@@ -126,13 +126,13 @@ func (c *Client) consumerMessage() {
 	}()
 
 	messages, err := c.channel.Consume(
-    c.queueName, // queue
-    c.queueName, // consumer
-		false,              // auto-ack
-		false,              // exclusive
-		false,              // no-local
-		false,              // no-wait
-		nil,                // args
+		c.queueName, // queue
+		c.queueName, // consumer
+		false,       // auto-ack
+		false,       // exclusive
+		false,       // no-local
+		false,       // no-wait
+		nil,         // args
 	)
 
 	if err != nil {
@@ -173,8 +173,12 @@ func (c *Client) Publish(exchange, routeKey string,
 		err = errors.New("source channel closed")
 		return
 	}
-	if confirm && msg.ReplyTo == "" {
-		msg.ReplyTo = c.config.QueuePrefix + c.config.QueueName
+	if confirm {
+		msg.ReplyTo = c.queueName
+		msg.Type = TYPE_REPLY
+	}
+	if msg.Type == "" {
+		msg.Type = TYPE_SIMPLE
 	}
 	err = c.channel.Publish(
 		exchange,

@@ -21,6 +21,7 @@ type Config struct {
 	Exchanges           []Exchange
 	QueuePrefix         string
 	QueueName           string
+	QueueAutoDelete     bool
 	UseTls              bool
 	ReplyConfirmTimeout time.Duration
 	Amqp                amqp.Config
