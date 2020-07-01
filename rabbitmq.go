@@ -75,45 +75,47 @@ func (c *Client) Start() (err error) {
 	if err != nil {
 		return
 	}
-	c.confirmChan = c.channel.NotifyPublish(make(chan amqp.Confirmation, 1))
-	err = c.channel.Confirm(false)
-	if err != nil {
-		return
-	}
-
-	err = c.channel.Qos(c.config.Prefetch, 0, false)
-	if err != nil {
-		return
-	}
-	_, err = c.channel.QueueDeclare(
-		c.queueName,              // name
-		true,                     // durable
-		c.config.QueueAutoDelete, // delete when unused
-		false,                    // exclusive
-		false,                    // no-wait
-		nil,                      // arguments
-	)
-	if err != nil {
-		return
-	}
-
-	for _, v := range c.config.Exchanges {
-		err = c.channel.ExchangeDeclare(v.Name, v.Kind, true, false, false, false, nil)
+	if c.config.QueueEnable {
+		c.confirmChan = c.channel.NotifyPublish(make(chan amqp.Confirmation, 1))
+		err = c.channel.Confirm(false)
 		if err != nil {
 			return
 		}
-		err = c.channel.QueueBind(
-			c.queueName, // queue name
-			c.queueName, // routing key
-			v.Name,      // exchange
-			false,
-			nil,
+
+		err = c.channel.Qos(c.config.Prefetch, 0, false)
+		if err != nil {
+			return
+		}
+		_, err = c.channel.QueueDeclare(
+			c.queueName,              // name
+			true,                     // durable
+			c.config.QueueAutoDelete, // delete when unused
+			false,                    // exclusive
+			false,                    // no-wait
+			nil,                      // arguments
 		)
 		if err != nil {
 			return
 		}
+
+		for _, v := range c.config.Exchanges {
+			err = c.channel.ExchangeDeclare(v.Name, v.Kind, true, false, false, false, nil)
+			if err != nil {
+				return
+			}
+			err = c.channel.QueueBind(
+				c.queueName, // queue name
+				c.queueName, // routing key
+				v.Name,      // exchange
+				false,
+				nil,
+			)
+			if err != nil {
+				return
+			}
+		}
+		go c.consumerMessage()
 	}
-	go c.consumerMessage()
 	if !c.recovering {
 		go c.recovery()
 	}
@@ -172,6 +174,9 @@ func (c *Client) Publish(exchange, routeKey string,
 	if c.isClosed() {
 		err = errors.New("source channel closed")
 		return
+	}
+	if !c.config.QueueEnable {
+		confirm = false
 	}
 	if confirm {
 		msg.ReplyTo = c.queueName

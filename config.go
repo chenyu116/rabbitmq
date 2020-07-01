@@ -22,6 +22,7 @@ type Config struct {
 	QueuePrefix         string
 	QueueName           string
 	QueueAutoDelete     bool
+	QueueEnable         bool
 	UseTls              bool
 	ReplyConfirmTimeout time.Duration
 	Amqp                amqp.Config
