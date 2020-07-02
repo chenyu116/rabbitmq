@@ -50,14 +50,11 @@ func NewTlsConfig(caFile, certFile, keyFile, keyFilePassword string) *tls.Config
 					cfg.Certificates = append(cfg.Certificates, cert)
 				}
 			}
-			// Move the client cert and key to a location specific to your application
-			// and load them here.
-		} else {
-			if cert, err := tls.LoadX509KeyPair(certFile, keyFile); err == nil {
-				cfg.Certificates = append(cfg.Certificates, cert)
-			}
 		}
-
+	} else {
+		if cert, err := tls.LoadX509KeyPair(certFile, keyFile); err == nil {
+			cfg.Certificates = append(cfg.Certificates, cert)
+		}
 	}
 	return cfg
 }
