@@ -1,7 +1,6 @@
 package rabbitmq
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"github.com/streadway/amqp"
@@ -40,6 +39,9 @@ func NewClient(cfg *Config) *Client {
 		confirmMap:      make(map[string]*replyConfirm, 10),
 		consumersLenMap: make(map[string]int32),
 	}
+}
+func (c *Client) GetQueueName() string {
+	return c.queueName
 }
 func (c *Client) AddReplyConsumer(consumer func(msg amqp.Delivery)) {
 	c.replyConsumer = append(c.replyConsumer, consumer)
@@ -143,17 +145,15 @@ func (c *Client) consumerMessage() {
 
 	for msg := range messages {
 		go func(d amqp.Delivery) {
-			if d.Type == TYPE_REPLY && d.ReplyTo != "" {
+			if d.ReplyTo != "" {
 				c.confirmMapMu.Lock()
 				if b, ok := c.confirmMap[d.ReplyTo]; ok {
 					b.Done()
 					delete(c.confirmMap, d.ReplyTo)
 					if len(c.replyConsumer) > 0 {
-						go func(rMsg amqp.Delivery) {
-							for _, rc := range c.replyConsumer {
-								rc(rMsg)
-							}
-						}(d)
+						for _, rc := range c.replyConsumer {
+							rc(d)
+						}
 					}
 				}
 				c.confirmMapMu.Unlock()
@@ -179,11 +179,8 @@ func (c *Client) Publish(exchange, routeKey string,
 	}
 	if confirm {
 		msg.ReplyTo = c.queueName
-		msg.Type = TYPE_REPLY
 	}
-	if msg.Type == "" {
-		msg.Type = TYPE_SIMPLE
-	}
+
 	err = c.channel.Publish(
 		exchange,
 		routeKey,
@@ -193,25 +190,26 @@ func (c *Client) Publish(exchange, routeKey string,
 	if err != nil {
 		return
 	}
-	if m := <-c.confirmChan; !m.Ack {
-		err = errors.New("publish fail")
-		return
+	select {
+	case m := <-c.confirmChan:
+		if !m.Ack {
+			err = errors.New("publish fail")
+			return
+		}
 	}
 
 	if confirm {
 		rc := &replyConfirm{
-			done: make(chan bool),
+			done: make(chan bool, 1),
 		}
 		c.confirmMapMu.Lock()
 		c.confirmMap[msg.ReplyTo] = rc
 		c.confirmMapMu.Unlock()
-		ctx, cancel := context.WithTimeout(context.Background(), c.config.ReplyConfirmTimeout)
 		select {
 		case <-rc.done:
 			fmt.Println("rc.done")
-			cancel()
 			return
-		case <-ctx.Done():
+		case <-time.After(c.config.ReplyConfirmTimeout):
 			err = errors.New("confirmed timeout")
 			c.confirmMapMu.Lock()
 			delete(c.confirmMap, msg.ReplyTo)
