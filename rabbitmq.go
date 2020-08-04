@@ -1,6 +1,7 @@
 package rabbitmq
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"github.com/streadway/amqp"
@@ -18,7 +19,7 @@ type Client struct {
 	config               *Config
 	conn                 *amqp.Connection
 	channel              *amqp.Channel
-	confirmMap           map[string]*replyConfirm
+	confirmMap           map[string]context.CancelFunc
 	confirmMapMu         sync.Mutex
 	confirm              chan uint64
 	confirmChan          chan amqp.Confirmation
@@ -36,7 +37,7 @@ type Client struct {
 func NewClient(cfg *Config) *Client {
 	return &Client{
 		config:          cfg,
-		confirmMap:      make(map[string]*replyConfirm, 10),
+		confirmMap:      make(map[string]context.CancelFunc, 10),
 		consumersLenMap: make(map[string]int32),
 	}
 }
@@ -147,16 +148,20 @@ func (c *Client) consumerMessage() {
 		go func(d amqp.Delivery) {
 			if d.ReplyTo != "" {
 				c.confirmMapMu.Lock()
-				if b, ok := c.confirmMap[d.ReplyTo]; ok {
-					b.Done()
+				if cancel, ok := c.confirmMap[d.ReplyTo]; ok {
+					cancel()
 					delete(c.confirmMap, d.ReplyTo)
-					if len(c.replyConsumer) > 0 {
-						for _, rc := range c.replyConsumer {
-							rc(d)
-						}
+					c.confirmMapMu.Unlock()
+				} else {
+					c.confirmMapMu.Unlock()
+					return
+				}
+
+				if len(c.replyConsumer) > 0 {
+					for _, rc := range c.replyConsumer {
+						rc(d)
 					}
 				}
-				c.confirmMapMu.Unlock()
 
 			} else {
 				for _, mc := range c.messageConsumer {
@@ -178,7 +183,7 @@ func (c *Client) Publish(exchange, routeKey string,
 		confirm = false
 	}
 	if confirm {
-		msg.ReplyTo = c.queueName
+		msg.AppId = c.queueName
 	}
 
 	err = c.channel.Publish(
@@ -191,6 +196,9 @@ func (c *Client) Publish(exchange, routeKey string,
 		return
 	}
 	select {
+	case <-time.After(c.config.ReplyConfirmTimeout):
+		err = errors.New("publish fail")
+		return
 	case m := <-c.confirmChan:
 		if !m.Ack {
 			err = errors.New("publish fail")
@@ -199,22 +207,18 @@ func (c *Client) Publish(exchange, routeKey string,
 	}
 
 	if confirm {
-		rc := &replyConfirm{
-			done: make(chan bool, 1),
-		}
+		ctx, can := context.WithTimeout(context.Background(), c.config.ReplyConfirmTimeout)
 		c.confirmMapMu.Lock()
-		c.confirmMap[msg.ReplyTo] = rc
+		c.confirmMap[msg.ReplyTo] = can
 		c.confirmMapMu.Unlock()
-		select {
-		case <-rc.done:
-			fmt.Println("rc.done")
-			return
-		case <-time.After(c.config.ReplyConfirmTimeout):
-			err = errors.New("confirmed timeout")
-			c.confirmMapMu.Lock()
-			delete(c.confirmMap, msg.ReplyTo)
-			c.confirmMapMu.Unlock()
+		<-ctx.Done()
+		if ctx.Err() == context.Canceled {
+			return nil
 		}
+		err = errors.New("confirmed timeout")
+		c.confirmMapMu.Lock()
+		delete(c.confirmMap, msg.ReplyTo)
+		c.confirmMapMu.Unlock()
 	}
 	return
 }
