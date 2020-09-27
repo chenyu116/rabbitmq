@@ -182,9 +182,13 @@ func (c *Client) Publish(exchange, routeKey string,
 	if !c.config.QueueEnable {
 		confirm = false
 	}
+	if confirm && msg.ReplyTo == "" {
+		err = errors.New("ReplyTo not defined")
+		return
+	}
 	timeout := c.config.ReplyConfirmTimeout
-	if confirm {
-		msg.ReplyTo = c.queueName
+	if msg.AppId == "" {
+		msg.AppId = c.queueName
 	}
 
 	if msg.Expiration != "" {
