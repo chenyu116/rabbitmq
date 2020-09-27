@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/streadway/amqp"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -140,7 +141,6 @@ func (c *Client) consumerMessage() {
 	)
 
 	if err != nil {
-		log.Println(err)
 		return
 	}
 
@@ -182,8 +182,19 @@ func (c *Client) Publish(exchange, routeKey string,
 	if !c.config.QueueEnable {
 		confirm = false
 	}
+	timeout := c.config.ReplyConfirmTimeout
 	if confirm {
-		msg.AppId = c.queueName
+		msg.ReplyTo = c.queueName
+	}
+
+	if msg.Expiration != "" {
+		expiration, err := strconv.Atoi(msg.Expiration)
+		if err == nil {
+			_timeout := time.Duration(expiration/1000) * time.Second
+			if _timeout > 0 {
+				timeout = _timeout
+			}
+		}
 	}
 
 	err = c.channel.Publish(
@@ -196,7 +207,7 @@ func (c *Client) Publish(exchange, routeKey string,
 		return
 	}
 	select {
-	case <-time.After(c.config.ReplyConfirmTimeout):
+	case <-time.After(timeout):
 		err = errors.New("publish fail")
 		return
 	case m := <-c.confirmChan:
@@ -207,7 +218,7 @@ func (c *Client) Publish(exchange, routeKey string,
 	}
 
 	if confirm {
-		ctx, can := context.WithTimeout(context.Background(), c.config.ReplyConfirmTimeout)
+		ctx, can := context.WithTimeout(context.Background(), timeout)
 		c.confirmMapMu.Lock()
 		c.confirmMap[msg.ReplyTo] = can
 		c.confirmMapMu.Unlock()
